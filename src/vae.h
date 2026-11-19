@@ -329,26 +329,11 @@ static struct ggml_tensor * vae_conv1d(struct ggml_context * ctx,
                                        int                   stride,
                                        int                   padding,
                                        int                   dilation) {
-    struct ggml_tensor * y;
-    if (w->type == GGML_TYPE_F32) {
-        // ggml_conv_1d unfolds the input into F16 whatever the kernel, and the GEMM then runs in F16 (tiled and whole
-        // decodes of VAE-RS differed by -55 dB, the fp16 error its release rules out). The same steps with an F32 unfold.
-        struct ggml_tensor * col = ggml_im2col(ctx, w, x, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
-        y = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, col, col->ne[0], col->ne[2] * col->ne[1]),
-                         ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));
-        // true float32 on CUDA too, where cuBLAS runs F32 in TF32 by default (honoured by a ggml with the strict-F32
-        // request on src1; see ggml PR "CUDA: an F32 request on src1 is met without TF32")
-        ggml_prec_set_src(y, GGML_PREC_F32, 1);
-        y = ggml_reshape_3d(ctx, y, col->ne[1], col->ne[2], w->ne[2]);
-        y = ggml_cont(ctx, ggml_permute(ctx, y, 0, 2, 1, 3));
-        // ggml_conv_1d returns [OL, OC, N=1], squeeze to 2d
-        y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
-    } else {
-        // implicit GEMM conv of a one row image, the patches only expand in shared memory: [T, IC] -> [T_out, OC]
-        y = ggml_conv_2d_direct(ctx, ggml_reshape_4d(ctx, w, w->ne[0], 1, w->ne[1], w->ne[2]),
-                                ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], 1), stride, 1, padding, 0, dilation, 1);
-        y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[2]);
-    }
+    // implicit GEMM conv of a one row image, the patches only expand in shared memory: [T, IC] -> [T_out, OC]
+    struct ggml_tensor * y =
+        ggml_conv_2d_direct(ctx, ggml_reshape_4d(ctx, w, w->ne[0], 1, w->ne[1], w->ne[2]),
+                            ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], 1), stride, 1, padding, 0, dilation, 1);
+    y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[2]);
     if (b) {
         // bias [OC] -> [1, OC] for broadcast over OL dimension
         struct ggml_tensor * b2d = ggml_reshape_2d(ctx, b, 1, b->ne[0]);
@@ -453,7 +438,7 @@ static int vae_ggml_compute(VAEGGML *     m,
         }
 
         // Graph context (generous fixed allocation)
-        size_t ctx_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(8192, false);  // VAE-RS ~2.3x the nodes
+        size_t ctx_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(16384, false);  // VAE-RS ~2.3x the nodes
         m->graph_buf    = (uint8_t *) malloc(ctx_size);
         if (!m->graph_buf) {
             fprintf(stderr, "[VAE] FATAL: OOM allocating graph context (%zu bytes) for T=%d\n", ctx_size, T_latent);
@@ -471,7 +456,7 @@ static int vae_ggml_compute(VAEGGML *     m,
         ggml_set_name(m->graph_output, "vae_output");
         ggml_set_output(m->graph_output);
 
-        m->graph = ggml_new_graph_custom(ctx, 8192, false);
+        m->graph = ggml_new_graph_custom(ctx, 16384, false);
         ggml_build_forward_expand(m->graph, m->graph_output);
 
         if (!ggml_backend_sched_alloc_graph(m->sched, m->graph)) {
